@@ -30,7 +30,7 @@ function writeJSON(f, d) { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
 
 app.use("/files", express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (req, res) => res.send("Messenger server v5 running"));
+app.get("/", (req, res) => res.send("Messenger server v6 running"));
 
 const online = new Map();
 
@@ -62,7 +62,6 @@ io.on("connection", (socket) => {
     if (record.username) saveUser({ ...record, id: record.username });
     io.emit("users", Array.from(online.values()).map(publicUser));
 
-    // Отправляем пользователю его группы
     const groups = readJSON(GROUPS_FILE, []);
     const mine = groups.filter(g => g.members.includes(socket.id));
     socket.emit("my-groups", mine);
@@ -103,7 +102,6 @@ io.on("connection", (socket) => {
     if (recipient) socket.emit("message-status", { messageIds: [payload.id], status: "delivered" });
   });
 
-  // ---------- ГРУППЫ И КАНАЛЫ ----------
   socket.on("create-group", (data, ack) => {
     const groups = readJSON(GROUPS_FILE, []);
     const g = {
@@ -132,8 +130,7 @@ io.on("connection", (socket) => {
     const u = online.get(socket.id) || { name: "Аноним" };
     const payload = {
       id: "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
-      from: socket.id,
-      name: u.name, username: u.username,
+      from: socket.id, name: u.name, username: u.username,
       text: msg.text || "",
       fileUrl: msg.fileUrl || null, fileType: msg.fileType || null,
       duration: msg.duration || null,
@@ -145,7 +142,6 @@ io.on("connection", (socket) => {
     db.push(payload);
     if (db.length > 10000) db.splice(0, db.length - 10000);
     writeJSON(DB_FILE, db);
-
     socket.emit("message-ack", { tempId: msg.tempId, realId: payload.id, ts: payload.ts, status: "sent" });
     g.members.forEach(mid => {
       if (mid === socket.id) return;
@@ -227,10 +223,40 @@ io.on("connection", (socket) => {
     socket.broadcast.emit("typing", { from: socket.id, name: u.name, room: data.room || "global" });
   });
 
+  // ---------- WebRTC сигналинг ----------
+  socket.on("call-offer", (data) => {
+    const from = online.get(socket.id);
+    if (!from) return;
+    console.log("call-offer:", from.name, "->", data.to);
+    io.to(data.to).emit("call-incoming", {
+      from: socket.id,
+      fromName: from.name,
+      fromAvatar: from.avatar || "",
+      sdp: data.sdp,
+      callType: data.callType || "audio"
+    });
+  });
+
+  socket.on("call-answer", (data) => {
+    io.to(data.to).emit("call-answered", { from: socket.id, sdp: data.sdp });
+  });
+
+  socket.on("call-ice", (data) => {
+    io.to(data.to).emit("call-ice", { from: socket.id, candidate: data.candidate });
+  });
+
+  socket.on("call-reject", (data) => {
+    io.to(data.to).emit("call-rejected", { from: socket.id });
+  });
+
+  socket.on("call-end", (data) => {
+    io.to(data.to).emit("call-ended", { from: socket.id });
+  });
+
   socket.on("disconnect", () => {
     online.delete(socket.id);
     io.emit("users", Array.from(online.values()).map(publicUser));
   });
 });
 
-server.listen(PORT, () => console.log("Server v5 started on port " + PORT));
+server.listen(PORT, () => console.log("Server v6 started on port " + PORT));
