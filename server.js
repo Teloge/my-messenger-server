@@ -113,7 +113,7 @@ io.on("connection", (socket) => {
       owner: socket.id,
       ownerName: (online.get(socket.id) || {}).name || "Админ",
       avatar: data.avatar || "",
-      members: [socket.id, ...(data.members || []).filter(m => m !== socket.id)],
+      members: [socket.id, ...((data.members || []).filter(m => m !== socket.id))],
       createdAt: Date.now()
     };
     groups.push(g);
