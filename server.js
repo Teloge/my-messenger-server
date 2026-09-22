@@ -2,7 +2,6 @@ const express = require("express");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const multer = require("multer");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -32,30 +31,10 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || "";
-    cb(null, Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ext);
-  }
-});
-const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
-
 app.use("/files", express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, "public")));
 
-app.post("/upload", upload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "no file" });
-  const url = "/files/" + req.file.filename;
-  res.json({
-    url,
-    size: req.file.size,
-    name: req.file.originalname,
-    mime: req.file.mimetype
-  });
-});
-
-app.get("/", (req, res) => res.send("Messenger server v2 running"));
+app.get("/", (req, res) => res.send("Messenger server v3 running"));
 
 const online = new Map();
 
@@ -66,7 +45,6 @@ function saveUser(u) {
   else users[idx] = u;
   writeJSON(USERS_FILE, users);
 }
-
 function publicUser(u) {
   return { id: u.id, name: u.name, username: u.username,
            phone: u.phone, bio: u.bio, avatar: u.avatar || "", online: true };
@@ -87,6 +65,23 @@ io.on("connection", (socket) => {
     online.set(socket.id, record);
     if (record.username) saveUser({ ...record, id: record.username });
     io.emit("users", Array.from(online.values()).map(publicUser));
+  });
+
+  socket.on("upload", (data, ack) => {
+    try {
+      const base64 = data.data.includes(",") ? data.data.split(",")[1] : data.data;
+      const buf = Buffer.from(base64, "base64");
+      const ext = path.extname(data.name) || "";
+      const filename = Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ext;
+      fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
+      const url = "/files/" + filename;
+      console.log("uploaded:", filename, buf.length, "bytes");
+      if (typeof ack === "function") ack({ ok: true, url, size: buf.length, name: data.name });
+      else socket.emit("upload-ok", { url, size: buf.length, name: data.name });
+    } catch (e) {
+      console.log("upload error:", e.message);
+      if (typeof ack === "function") ack({ ok: false, error: e.message });
+    }
   });
 
   socket.on("message", (msg) => {
@@ -114,12 +109,11 @@ io.on("connection", (socket) => {
 
   socket.on("history", (data) => {
     const db = readJSON(DB_FILE, []);
-    const peer = data.peer;
     const myId = socket.id;
+    const peer = data.peer;
     const filtered = db.filter(m =>
       (m.from === myId && m.room === peer) ||
-      (m.from === peer && m.room === myId) ||
-      (m.room === peer && m.room === myId)
+      (m.from === peer && m.room === myId)
     ).slice(-200);
     socket.emit("history", filtered);
   });
@@ -144,4 +138,4 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(PORT, () => console.log("Server v2 started on port " + PORT));
+server.listen(PORT, () => console.log("Server v3 started on port " + PORT));
