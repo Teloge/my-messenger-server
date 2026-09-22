@@ -17,18 +17,20 @@ const DATA_DIR = path.join(__dirname, "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const DB_FILE = path.join(DATA_DIR, "messages.json");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
+const GROUPS_FILE = path.join(DATA_DIR, "groups.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, "[]");
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "[]");
+if (!fs.existsSync(GROUPS_FILE)) fs.writeFileSync(GROUPS_FILE, "[]");
 
 function readJSON(f, def) { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return def; } }
 function writeJSON(f, d) { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
 
 app.use("/files", express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (req, res) => res.send("Messenger server v4 running"));
+app.get("/", (req, res) => res.send("Messenger server v5 running"));
 
 const online = new Map();
 
@@ -56,8 +58,14 @@ io.on("connection", (socket) => {
       avatar: user.avatar || ""
     };
     online.set(socket.id, record);
+    socket.join(socket.id);
     if (record.username) saveUser({ ...record, id: record.username });
     io.emit("users", Array.from(online.values()).map(publicUser));
+
+    // Отправляем пользователю его группы
+    const groups = readJSON(GROUPS_FILE, []);
+    const mine = groups.filter(g => g.members.includes(socket.id));
+    socket.emit("my-groups", mine);
   });
 
   socket.on("upload", (data, ack) => {
@@ -69,46 +77,107 @@ io.on("connection", (socket) => {
       fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
       const url = "/files/" + filename;
       if (typeof ack === "function") ack({ ok: true, url, size: buf.length, name: data.name });
-    } catch (e) {
-      if (typeof ack === "function") ack({ ok: false, error: e.message });
-    }
+    } catch (e) { if (typeof ack === "function") ack({ ok: false, error: e.message }); }
   });
 
   socket.on("message", (msg) => {
     const u = online.get(socket.id) || { name: "Аноним" };
     const payload = {
       id: "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
-      from: socket.id,
-      to: msg.to || null,
-      name: u.name,
-      username: u.username,
+      from: socket.id, to: msg.to || null,
+      name: u.name, username: u.username,
       text: msg.text || "",
-      fileUrl: msg.fileUrl || null,
-      fileType: msg.fileType || null,
+      fileUrl: msg.fileUrl || null, fileType: msg.fileType || null,
       duration: msg.duration || null,
       room: msg.room || "global",
-      reply: msg.reply || null,
-      forwarded: msg.forwarded || false,
-      status: "sent",
-      ts: Date.now()
+      reply: msg.reply || null, forwarded: msg.forwarded || false,
+      status: "sent", ts: Date.now()
+    };
+    const db = readJSON(DB_FILE, []);
+    db.push(payload);
+    if (db.length > 10000) db.splice(0, db.length - 10000);
+    writeJSON(DB_FILE, db);
+    socket.emit("message-ack", { tempId: msg.tempId, realId: payload.id, ts: payload.ts, status: "sent" });
+    socket.broadcast.emit("message", payload);
+    const recipient = Array.from(online.values()).find(x => x.id === msg.to);
+    if (recipient) socket.emit("message-status", { messageIds: [payload.id], status: "delivered" });
+  });
+
+  // ---------- ГРУППЫ И КАНАЛЫ ----------
+  socket.on("create-group", (data, ack) => {
+    const groups = readJSON(GROUPS_FILE, []);
+    const g = {
+      id: "g_" + Date.now().toString(36),
+      name: data.name || "Группа",
+      type: data.type || "group",
+      owner: socket.id,
+      ownerName: (online.get(socket.id) || {}).name || "Админ",
+      avatar: data.avatar || "",
+      members: [socket.id, ...(data.members || []).filter(m => m !== socket.id)],
+      createdAt: Date.now()
+    };
+    groups.push(g);
+    writeJSON(GROUPS_FILE, groups);
+    g.members.forEach(mid => io.to(mid).emit("group-created", g));
+    if (typeof ack === "function") ack({ ok: true, group: g });
+    console.log("group created:", g.id, g.name, "members:", g.members.length);
+  });
+
+  socket.on("group-message", (msg) => {
+    const groups = readJSON(GROUPS_FILE, []);
+    const g = groups.find(x => x.id === msg.groupId);
+    if (!g) return;
+    if (g.type === "channel" && g.owner !== socket.id) return;
+
+    const u = online.get(socket.id) || { name: "Аноним" };
+    const payload = {
+      id: "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+      from: socket.id,
+      name: u.name, username: u.username,
+      text: msg.text || "",
+      fileUrl: msg.fileUrl || null, fileType: msg.fileType || null,
+      duration: msg.duration || null,
+      room: g.id, groupId: g.id, isGroup: true,
+      reply: msg.reply || null, forwarded: msg.forwarded || false,
+      ts: Date.now(), status: "sent"
     };
     const db = readJSON(DB_FILE, []);
     db.push(payload);
     if (db.length > 10000) db.splice(0, db.length - 10000);
     writeJSON(DB_FILE, db);
 
-    // отправили себе — подтверждение
     socket.emit("message-ack", { tempId: msg.tempId, realId: payload.id, ts: payload.ts, status: "sent" });
+    g.members.forEach(mid => {
+      if (mid === socket.id) return;
+      io.to(mid).emit("group-message", payload);
+    });
+  });
 
-    // остальным
-    socket.broadcast.emit("message", payload);
+  socket.on("update-group", (data) => {
+    const groups = readJSON(GROUPS_FILE, []);
+    const g = groups.find(x => x.id === data.id);
+    if (!g || g.owner !== socket.id) return;
+    if (data.name) g.name = data.name;
+    if (data.avatar !== undefined) g.avatar = data.avatar;
+    if (data.members) g.members = data.members;
+    writeJSON(GROUPS_FILE, groups);
+    g.members.forEach(mid => io.to(mid).emit("group-updated", g));
+  });
 
-    // пометили как доставленное — если получатель онлайн
-    const recipient = Array.from(online.values()).find(x => x.id === msg.to);
-    if (recipient) {
-      socket.emit("message-status", { messageIds: [payload.id], status: "delivered" });
-      payload.status = "delivered";
-    }
+  socket.on("leave-group", (data) => {
+    const groups = readJSON(GROUPS_FILE, []);
+    const g = groups.find(x => x.id === data.id);
+    if (!g) return;
+    g.members = g.members.filter(m => m !== socket.id);
+    writeJSON(GROUPS_FILE, groups);
+    g.members.forEach(mid => io.to(mid).emit("group-updated", g));
+    socket.emit("group-left", { id: data.id });
+  });
+
+  socket.on("history-group", (data) => {
+    const db = readJSON(DB_FILE, []);
+    const filtered = db.filter(m => m.room === data.groupId).slice(-300);
+    socket.emit("history-group", { groupId: data.groupId, messages: filtered });
   });
 
   socket.on("edit", (data) => {
@@ -161,8 +230,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     online.delete(socket.id);
     io.emit("users", Array.from(online.values()).map(publicUser));
-    console.log("disconnect:", socket.id);
   });
 });
 
-server.listen(PORT, () => console.log("Server v4 started on port " + PORT));
+server.listen(PORT, () => console.log("Server v5 started on port " + PORT));
